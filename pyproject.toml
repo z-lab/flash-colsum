@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flash-colsum"
-version = "0.2.0"
+version = "0.1.0"
 description = "Fast attention column-sum primitives with Triton kernels"
 readme = "README.md"
 requires-python = ">=3.10"
