@@ -18,7 +18,7 @@ pip install flash-colsum
 
 From source:
 ```bash
-git clone https://github.com/your-org/flash-colsum.git
+git clone https://github.com/z-lab/flash-colsum.git
 cd flash-colsum
 pip install -e .
 ```
