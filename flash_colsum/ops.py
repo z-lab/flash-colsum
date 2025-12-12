@@ -1,109 +1,94 @@
 """
-Flash-ColSum: Efficient attention column-sum operations.
+Flash-ColSum Operations
+=======================
+
+High-level API for Flash-ColSum operations.
 """
 
+from .kernel_unified import flash_colsum as _flash_colsum_kernel
 import torch
-from typing import Optional
-
-from .kernel_noncausal_batched import _flash_colsum_batched
-from .kernel_noncausal import _flash_colsum_non_batched
-from .kernel_causal import _flash_colsum_causal
 
 
 def flash_colsum(
     query: torch.Tensor,
     key: torch.Tensor,
-    scale: Optional[float] = None,
+    scale: float = None,
     is_causal: bool = False,
-    cls_len: Optional[int] = None,
 ) -> torch.Tensor:
     """
-    Compute attention column means efficiently without materializing full attention matrix.
+    Compute column sums of the softmax attention matrix using Flash Attention.
+    
+    This is memory-efficient and does not materialize the full attention matrix.
     
     Args:
-        query: Query tensor (B, H, S, D) for non-causal or (1, H, Q_len, D) for causal
-        key: Key tensor (same shape as query for non-causal or (1, H, K_len, D) for causal)
-        scale: Attention scale factor. If None, uses 1/sqrt(D). Default: None
-        is_causal: Whether to apply causal masking. Default: False
-        cls_len: Optional number of leading query positions (CLS-style tokens)
-            to average over in the non-causal case. If None (default), averages
-            over all query positions.
-    
+        query: Query tensor of shape (B, H, Q_len, D)
+        key: Key tensor of shape (B, H, K_len, D)
+        scale: Attention scale factor. Default: 1/sqrt(D)
+        is_causal: If True, applies right-aligned causal masking
+        
     Returns:
-        Column means of attention matrix:
-            - Non-causal (no cls_len): (B, S) - mean over heads and all query positions
-            - Non-causal with cls_len: (B, S) - mean over heads and first cls_len positions
-            - Causal: (1, K_len) - mean over heads and query positions
-    
-    Raises:
-        ValueError: If causal attention requested with B > 1
-        ValueError: If input shapes are invalid
-    
-    Examples:
-        >>> # Batched non-causal (ViT, BERT, etc.)
-        >>> Q = torch.randn(8, 16, 2048, 64, device='cuda', dtype=torch.float16)
-        >>> K = Q.clone()
-        >>> col_mean = flash_colsum(Q, K)  # (8, 2048)
-        
-        >>> # Non-batched (single sample with large sequence)
-        >>> Q = torch.randn(1, 16, 65536, 64, device='cuda', dtype=torch.float16)
-        >>> K = Q.clone()
-        >>> col_mean = flash_colsum(Q, K)  # (1, 65536)
-        
-        >>> # Causal attention (GPT, retrieval, etc.)
-        >>> Q = torch.randn(1, 32, 128, 128, device='cuda', dtype=torch.float16)
-        >>> K = torch.randn(1, 32, 4096, 128, device='cuda', dtype=torch.float16)
-        >>> col_mean = flash_colsum(Q, K, is_causal=True)  # (1, 4096)
+        Column sums of shape (B, K_len)
     """
     # Validate inputs
-    if query.ndim != 4 or key.ndim != 4:
-        raise ValueError(f"Expected 4D tensors, got query.ndim={query.ndim}, key.ndim={key.ndim}")
+    if not query.is_cuda or not key.is_cuda:
+        raise ValueError("Query and Key tensors must be on CUDA device")
     
-    if query.device.type != 'cuda':
-        raise ValueError(f"Flash attention only supports CUDA tensors, got {query.device}")
+    B, H, Q_len, D = query.shape
+    B_k, H_k, K_len, D_k = key.shape
     
-    if cls_len is not None and is_causal:
-        raise ValueError("cls_len is only supported for non-causal attention")
-    if cls_len is not None and cls_len <= 0:
-        raise ValueError(f"cls_len must be positive, got {cls_len}")
+    if B != B_k or H != H_k or D != D_k:
+        raise ValueError(f"Query and Key must have same batch, heads, and dim. "
+                        f"Got Q: {query.shape}, K: {key.shape}")
     
-    B_q, H_q, S_q, D_q = query.shape
-    B_k, H_k, S_k, D_k = key.shape
+    return _flash_colsum_kernel(query, key, causal=is_causal, sm_scale=scale)
+
+
+def flash_colmean(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    scale: float = None,
+    is_causal: bool = False,
+) -> torch.Tensor:
+    """
+    Compute column means of the softmax attention matrix using Flash Attention.
     
-    # Compute scale
-    if scale is None:
-        scale = 1.0 / (D_q ** 0.5)
+    This is memory-efficient and does not materialize the full attention matrix.
     
-    if is_causal:
-        # Causal attention: short query to long key retrieval
-        if B_q != 1 or B_k != 1:
-            raise ValueError(
-                f"Causal attention currently only supports batch size 1, got B_q={B_q}, B_k={B_k}"
-            )
-        if H_q != H_k or D_q != D_k:
-            raise ValueError(
-                f"Query and key must have same heads and head_dim, got "
-                f"H_q={H_q}, H_k={H_k}, D_q={D_q}, D_k={D_k}"
-            )
+    For causal attention with right-aligned masking, each key position has a 
+    different number of attending queries (staircase pattern). This function
+    automatically computes the correct per-key normalization factor:
+    - Keys 0 to K_PAST-1: normalized by H * Q_len (all queries attend)
+    - Keys K_PAST to K_len-1: normalized by H * (K_len - k) (decreasing)
+    
+    Args:
+        query: Query tensor of shape (B, H, Q_len, D)
+        key: Key tensor of shape (B, H, K_len, D)
+        scale: Attention scale factor. Default: 1/sqrt(D)
+        is_causal: If True, applies right-aligned causal masking
         
-        return _flash_colsum_causal(query, key, scale)
+    Returns:
+        Column means of shape (B, K_len)
+    """
+    B, H, Q_len, _ = query.shape
+    _, _, K_len, _ = key.shape
     
+    col_sum = flash_colsum(query, key, scale, is_causal)
+    
+    if is_causal and Q_len != K_len:
+        # Right-aligned causal: per-key normalization factors
+        # Keys 0 to K_PAST-1: all Q_len queries attend
+        # Keys K_PAST to K_len-1: (K_len - k) queries attend (decreasing: Q_len, Q_len-1, ..., 1)
+        K_PAST = K_len - Q_len
+        norm_factors = torch.empty(K_len, device=query.device, dtype=col_sum.dtype)
+        norm_factors[:K_PAST] = H * Q_len
+        norm_factors[K_PAST:] = H * torch.arange(Q_len, 0, -1, device=query.device, dtype=col_sum.dtype)
+        return col_sum / norm_factors
     else:
-        # Non-causal attention
-        if B_q != B_k or H_q != H_k or S_q != S_k or D_q != D_k:
-            raise ValueError(
-                f"For non-causal attention, query and key must have same shape, got "
-                f"query: {query.shape}, key: {key.shape}"
-            )
-        
-        cls_n = -1 if cls_len is None else int(cls_len)
-        
-        # Choose kernel: non-batched (B=1) vs batched
-        if B_q == 1:
-            return _flash_colsum_non_batched(query, key, scale, CLS_N=cls_n)
-        else:
-            return _flash_colsum_batched(query, key, scale, CLS_N=cls_n)
+        # Non-causal or square causal: uniform normalization
+        norm_factor = H * Q_len
+        return col_sum / norm_factor
 
 
-__all__ = ['flash_colsum']
+__all__ = ['flash_colsum', 'flash_colmean']
+
 

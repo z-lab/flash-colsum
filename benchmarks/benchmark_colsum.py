@@ -9,14 +9,16 @@ import matplotlib.pyplot as plt
 import matplotlib
 import torch
 
-from flash_colsum import flash_colsum, naive_colsum
+from flash_colsum import flash_colsum
+from benchmarks.baselines import naive_colsum, triton_attention
 from rich.console import Console
 from rich.table import Table
 from rich.progress import Progress, BarColumn, TimeElapsedColumn, TimeRemainingColumn
 
 # Modern color scheme
-COLOR_OURS = "#4CAF50"   # Medium green for flash-colsum/triton
+COLOR_OURS = "#4CAF50"   # Medium green for flash-colsum
 COLOR_NAIVE = "#E91E63"  # Moderate magenta for naive/torch
+COLOR_TRITON_ATTN = "#2196F3"  # Blue for triton flash attention
 COLOR_OOM = "#9E9E9E"    # Neutral gray for OOM annotations
 
 # Improved, readable global style
@@ -75,12 +77,13 @@ def run_chunked_baseline(strategy: str, Q: torch.Tensor, K: torch.Tensor, scale:
 	"""
 	Chunked baseline that processes in smaller chunks to avoid OOM.
 	- For noncausal_batched: chunks over batch dimension using batch_chunk_size.
+	- For causal_batched: chunks over batch dimension using batch_chunk_size.
 	- For noncausal/causal: chunks over sequence dimension using seq_chunk_size.
 	"""
 	B, H, *_ = Q.shape
 	
 	# Compute chunk sizes before defining function to avoid capturing loop vars
-	if strategy == "noncausal_batched":
+	if strategy in ("noncausal_batched", "causal_batched"):
 		if batch_chunk_size is None:
 			# Default if not provided: half the batch
 			batch_chunk_size = max(1, B // 2)
@@ -118,6 +121,32 @@ def run_chunked_baseline(strategy: str, Q: torch.Tensor, K: torch.Tensor, scale:
 			attn = torch.softmax(full_scores, dim=-1)
 			col_mean = attn.mean(dim=(1, 2))  # (1, K_len)
 			return col_mean
+		elif strategy == "causal_batched":
+			# For batched causal: Q,K are (B,H,Q_len/K_len,D) - chunk over BATCH dimension
+			Q_len, K_len = Q.shape[2], K.shape[2]
+			all_col_means = []
+			num_chunks = (B + batch_chunk_size - 1) // batch_chunk_size
+			for chunk_idx in range(num_chunks):
+				b_start = chunk_idx * batch_chunk_size
+				b_end = min(b_start + batch_chunk_size, B)
+				Q_chunk = Q[b_start:b_end]  # (chunk_B, H, Q_len, D)
+				K_chunk = K[b_start:b_end]  # (chunk_B, H, K_len, D)
+				
+				# QK^T: (chunk_B, H, Q_len, K_len)
+				scores = torch.matmul(Q_chunk, K_chunk.transpose(-2, -1)) * scale
+				
+				# Apply right-aligned causal mask
+				q_indices = torch.arange(Q_len, device=Q.device).unsqueeze(1)
+				k_indices = torch.arange(K_len, device=K.device).unsqueeze(0)
+				mask = q_indices < k_indices
+				scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+				
+				attn = torch.softmax(scores, dim=-1)
+				# Mean over heads and queries -> (chunk_B, K_len)
+				col_mean_chunk = attn.mean(dim=(1, 2))
+				all_col_means.append(col_mean_chunk)
+			# Concatenate results across batch chunks -> (B, K_len)
+			return torch.cat(all_col_means, dim=0)
 		elif strategy == "noncausal":
 			# For non-causal unbatched: Q,K are (1,H,S,D) - chunk over sequence dimension
 			S = Q.shape[2]
@@ -207,49 +236,70 @@ def run_point(
 	last_successful_size: int = None,
 	last_successful_latency: Optional[float] = None,
 	last_successful_memory: Optional[float] = None,
+	methods: Optional[List[str]] = None,  # None = all, or subset of ["naive", "flash_colsum", "triton_fa2"]
 ) -> Dict[str, Optional[float]]:
+	"""
+	Run benchmark for specified methods.
+	
+	Args:
+		methods: List of methods to run. Options: "naive", "flash_colsum", "triton_fa2"
+		         If None, runs all methods.
+	"""
+	import sys
+	
 	# Determine strategy name for chunked baseline compatibility
-	if is_causal:
+	if is_causal and Q.shape[0] > 1:
+		strategy = "causal_batched"
+	elif is_causal:
 		strategy = "causal"
 	elif Q.shape[0] == 1:
 		strategy = "noncausal"
 	else:
 		strategy = "noncausal_batched"
 	
-	# reference (naive PyTorch implementation)
-	def run_ref():
-		return naive_colsum(Q, K, scale=scale, is_causal=is_causal)
+	# Default to all methods if not specified
+	if methods is None:
+		methods = ["naive", "flash_colsum", "triton_fa2"]
+	
+	num_methods = len(methods)
+	method_idx = 0
 	res: Dict[str, Optional[float]] = {}
-	try:
-		t_ref = measure_latency(run_ref, warmup, iters)
-		m_ref = peak_memory(run_ref)
-	except RuntimeError as e:
-		if "out of memory" in str(e).lower():
-			t_ref, m_ref = None, None
-		else:
-			raise
+	t_ref, m_ref = None, None
+
+	# ========== PyTorch Naive ==========
+	if "naive" in methods:
+		method_idx += 1
+		print(f"  [{method_idx}/{num_methods}] PyTorch Naive...", end=" ", file=sys.stderr, flush=True)
+		def run_ref():
+			return naive_colsum(Q, K, scale=scale, is_causal=is_causal)
+		try:
+			t_ref = measure_latency(run_ref, warmup, iters)
+			m_ref = peak_memory(run_ref)
+			print(f"done ({t_ref*1000:.2f} ms)", file=sys.stderr)
+		except RuntimeError as e:
+			if "out of memory" in str(e).lower() or "CUDA" in str(e):
+				t_ref, m_ref = None, None
+				print("OOM", file=sys.stderr)
+			else:
+				raise
+		finally:
+			if torch.cuda.is_available():
+				torch.cuda.synchronize()
+				torch.cuda.empty_cache()
 	res["t_ref"] = t_ref
 	res["m_ref"] = float(m_ref) if m_ref is not None else None
 
-	# chunked baseline (only if requested and regular baseline OOM'd)
-	if measure_chunked and t_ref is None and last_successful_size is not None:
-		if strategy == "noncausal_batched" and last_successful_latency is not None:
-			# Batched non-causal: estimate chunked latency as
-			# (latency at last successful batch size) * (number of chunks).
-			total_size = Q.shape[0]  # batch size
+	# chunked baseline (only if naive requested and OOM'd)
+	if "naive" in methods and measure_chunked and t_ref is None and last_successful_size is not None:
+		if strategy in ("noncausal_batched", "causal_batched") and last_successful_latency is not None:
+			total_size = Q.shape[0]
 			num_chunks = math.ceil(total_size / last_successful_size)
 			t_chunked_est = last_successful_latency * num_chunks
-			# Memory for the chunked baseline is approximately the same as the
-			# last successful (non-OOM) configuration.
 			m_chunked_est = float(last_successful_memory) if last_successful_memory is not None else None
 			res["t_chunked"] = t_chunked_est
 			res["m_chunked"] = m_chunked_est
 		else:
-			# For unbatched non-causal and causal benchmarks, fall back to
-			# the actual chunked baseline implementation over sequence.
 			if strategy == "noncausal":
-				# Non-causal unbatched:
-				# Start from the last successful full sequence length as chunk size
 				chunk_S = last_successful_size
 				chunked_res = None
 				while chunk_S >= 128:
@@ -263,7 +313,6 @@ def run_point(
 				if chunked_res is not None:
 					res.update(chunked_res)
 			else:
-				# Causal: use last_successful_size as the sequence chunk size.
 				chunk_S = last_successful_size
 				chunked_res = run_chunked_baseline(
 					strategy, Q, K, scale, warmup, iters, seq_chunk_size=chunk_S
@@ -273,167 +322,434 @@ def run_point(
 		res["t_chunked"] = None
 		res["m_chunked"] = None
 
-	# fast (Triton kernel implementation)
-	try:
-		def run_fast():
-			return flash_colsum(Q, K, scale=scale, is_causal=is_causal)
-		t_fast = measure_latency(run_fast, warmup, iters)
-		m_fast = peak_memory(run_fast)
-	except Exception as e:
-		t_fast, m_fast = None, None
+	# ========== Flash-ColSum (Ours) ==========
+	t_fast, m_fast = None, None
+	if "flash_colsum" in methods:
+		method_idx += 1
+		print(f"  [{method_idx}/{num_methods}] Flash-ColSum...", end=" ", file=sys.stderr, flush=True)
+		try:
+			def run_fast():
+				return flash_colsum(Q, K, scale=scale, is_causal=is_causal)
+			t_fast = measure_latency(run_fast, warmup, iters)
+			m_fast = peak_memory(run_fast)
+			print(f"done ({t_fast*1000:.2f} ms)", file=sys.stderr)
+		except RuntimeError as e:
+			if "out of memory" in str(e).lower() or "CUDA" in str(e):
+				t_fast, m_fast = None, None
+				print("OOM", file=sys.stderr)
+			else:
+				t_fast, m_fast = None, None
+				print(f"failed ({type(e).__name__})", file=sys.stderr)
+		except Exception as e:
+			t_fast, m_fast = None, None
+			print(f"failed ({type(e).__name__})", file=sys.stderr)
+		finally:
+			if torch.cuda.is_available():
+				torch.cuda.synchronize()
+				torch.cuda.empty_cache()
 	res["t_fast"] = t_fast
 	res["m_fast"] = float(m_fast) if m_fast is not None else None
+
+	# ========== Triton FA2 ==========
+	t_triton_attn, m_triton_attn = None, None
+	if "triton_fa2" in methods:
+		method_idx += 1
+		print(f"  [{method_idx}/{num_methods}] Triton FA2...", end=" ", file=sys.stderr, flush=True)
+		V = None
+		try:
+			V = torch.randn_like(K)
+			def run_triton_attn():
+				return triton_attention(Q, K, V, is_causal=is_causal, scale=scale)
+			t_triton_attn = measure_latency(run_triton_attn, warmup, iters)
+			m_triton_attn = peak_memory(run_triton_attn)
+			print(f"done ({t_triton_attn*1000:.2f} ms)", file=sys.stderr)
+		except RuntimeError as e:
+			# Handle OOM like naive baseline
+			if "out of memory" in str(e).lower() or "CUDA" in str(e):
+				t_triton_attn, m_triton_attn = None, None
+				print("OOM", file=sys.stderr)
+			else:
+				t_triton_attn, m_triton_attn = None, None
+				print(f"failed ({type(e).__name__})", file=sys.stderr)
+		except Exception as e:
+			t_triton_attn, m_triton_attn = None, None
+			print(f"failed ({type(e).__name__})", file=sys.stderr)
+		finally:
+			# Clean up V tensor and CUDA cache
+			if V is not None:
+				del V
+			if torch.cuda.is_available():
+				torch.cuda.synchronize()
+				torch.cuda.empty_cache()
+	res["t_triton_attn"] = t_triton_attn
+	res["m_triton_attn"] = float(m_triton_attn) if m_triton_attn is not None else None
+	
+	# Clear CUDA cache to prevent memory issues between benchmark points
+	if torch.cuda.is_available():
+		torch.cuda.empty_cache()
+	
 	return res
 
 
-def sweep_noncausal_batched(device: torch.device, H: int, S: int, D: int, warmup: int, iters: int, out_dir: str, generate_plots: bool = False, measure_chunked: bool = True):
+def sweep_noncausal_batched(device: torch.device, H: int, S: int, D: int, warmup: int, iters: int, out_dir: str, generate_plots: bool = False, measure_chunked: bool = True, methods: Optional[List[str]] = None):
 	# Fix S=1024 and vary B up to 1024
 	B_values = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
 	results: List[Dict[str, Optional[float]]] = []
 	console = Console()
 	console.rule(f"[bold]Non-Causal Batched[/] S={S}, H={H}, D={D}")
+	# Also print fixed sequence length for terminal/pytest visibility
+	import sys
+	print(f"[size] S={S}", file=sys.stderr, flush=True)
 	last_successful_B = None
 	last_successful_t_ref = None
 	last_successful_m_ref = None
 	with Progress("[progress.description]{task.description}", BarColumn(), "{task.completed}/{task.total}", TimeElapsedColumn(), TimeRemainingColumn(), transient=True) as progress:
 		task = progress.add_task("Benchmarking", total=len(B_values))
 		for B in B_values:
-			dtype = torch.float16 if device.type == "cuda" else torch.float32
-			Q = torch.randn(B, H, S, D, device=device, dtype=dtype)
-			K = torch.randn(B, H, S, D, device=device, dtype=dtype)
-			scale = 1.0 / math.sqrt(D)
 			point = {"B": B, "H": H, "S": S, "D": D}
-			point.update(
-				run_point(
-					is_causal=False,
-					Q=Q,
-					K=K,
-					scale=scale,
-					warmup=warmup,
-					iters=iters,
-					measure_chunked=measure_chunked,
-					last_successful_size=last_successful_B,
-					last_successful_latency=last_successful_t_ref,
-					last_successful_memory=last_successful_m_ref,
+			Q, K = None, None
+			try:
+				if torch.cuda.is_available():
+					torch.cuda.synchronize()
+					torch.cuda.empty_cache()
+				dtype = torch.float16 if device.type == "cuda" else torch.float32
+				Q = torch.randn(B, H, S, D, device=device, dtype=dtype)
+				K = torch.randn(B, H, S, D, device=device, dtype=dtype)
+				scale = 1.0 / math.sqrt(D)
+				point.update(
+					run_point(
+						is_causal=False,
+						Q=Q,
+						K=K,
+						scale=scale,
+						warmup=warmup,
+						iters=iters,
+						measure_chunked=measure_chunked,
+						last_successful_size=last_successful_B,
+						last_successful_latency=last_successful_t_ref,
+						last_successful_memory=last_successful_m_ref,
+						methods=methods,
+					)
 				)
-			)
+				# Track last successful B for chunking
+				if point.get("t_ref") is not None:
+					last_successful_B = B
+					last_successful_t_ref = point.get("t_ref")
+					last_successful_m_ref = point.get("m_ref")
+			except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+				if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
+					console.print(f"[yellow]B={B}: OOM during tensor allocation[/yellow]")
+					point.update({
+						"t_ref": None, "m_ref": None,
+						"t_chunked": None, "m_chunked": None,
+						"t_fast": None, "m_fast": None,
+						"t_triton_attn": None, "m_triton_attn": None,
+					})
+				else:
+					raise
+			finally:
+				if Q is not None:
+					del Q
+				if K is not None:
+					del K
+				if torch.cuda.is_available():
+					torch.cuda.empty_cache()
 			results.append(point)
-			# Track last successful B for chunking
-			if point.get("t_ref") is not None:
-				last_successful_B = B
-				last_successful_t_ref = point.get("t_ref")
-				last_successful_m_ref = point.get("m_ref")
 			progress.advance(task)
 	_print_table(console, "Non-Causal Batched (S=1024)", "B", results)
 	if generate_plots:
 		_save_and_plot(results, x_key="B", title="Non-Causal Batched (S=1024) latency", ylabel="ms", out_dir=out_dir, filename="noncausal_batched_latency.png", value_keys=("t_ref", "t_fast"), scale_ms=True)
 		_save_and_plot(results, x_key="B", title="Non-Causal Batched (S=1024) memory", ylabel="GiB", out_dir=out_dir, filename="noncausal_batched_memory.png", value_keys=("m_ref", "m_fast"), scale_gib=True)
-	_save_csv(results, os.path.join(out_dir, "noncausal_batched.csv"))
+	_save_csv(results, os.path.join(out_dir, "noncausal_batched.csv"), primary_key="B")
 	return results
 
 
-def sweep_noncausal(device: torch.device, H: int, D: int, warmup: int, iters: int, out_dir: str, generate_plots: bool = False, measure_chunked: bool = True):
+def sweep_noncausal(device: torch.device, H: int, D: int, warmup: int, iters: int, out_dir: str, generate_plots: bool = False, measure_chunked: bool = True, methods: Optional[List[str]] = None):
 	# B=1, S up to 256K
 	S_values = [2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
 	results: List[Dict[str, Optional[float]]] = []
 	console = Console()
 	console.rule(f"[bold]Non-Causal ColSum (B=1)[/] H={H}, D={D}")
+	# Print the swept sequence length for terminal/pytest
+	import sys
 	last_successful_S = None
 	last_successful_t_ref = None
 	last_successful_m_ref = None
 	with Progress("[progress.description]{task.description}", BarColumn(), "{task.completed}/{task.total}", TimeElapsedColumn(), TimeRemainingColumn(), transient=True) as progress:
 		task = progress.add_task("Benchmarking", total=len(S_values))
 		for S in S_values:
-			dtype = torch.float16 if device.type == "cuda" else torch.float32
-			Q = torch.randn(1, H, S, D, device=device, dtype=dtype)
-			K = torch.randn(1, H, S, D, device=device, dtype=dtype)
-			scale = 1.0 / math.sqrt(D)
+			print(f"[size] S={S}", file=sys.stderr, flush=True)
 			point = {"B": 1, "H": H, "S": S, "D": D}
-			point.update(
-				run_point(
-					is_causal=False,
-					Q=Q,
-					K=K,
-					scale=scale,
-					warmup=warmup,
-					iters=iters,
-					measure_chunked=measure_chunked,
-					last_successful_size=last_successful_S,
-					last_successful_latency=last_successful_t_ref,
-					last_successful_memory=last_successful_m_ref,
+			Q, K = None, None
+			try:
+				if torch.cuda.is_available():
+					torch.cuda.synchronize()
+					torch.cuda.empty_cache()
+				dtype = torch.float16 if device.type == "cuda" else torch.float32
+				Q = torch.randn(1, H, S, D, device=device, dtype=dtype)
+				K = torch.randn(1, H, S, D, device=device, dtype=dtype)
+				scale = 1.0 / math.sqrt(D)
+				point.update(
+					run_point(
+						is_causal=False,
+						Q=Q,
+						K=K,
+						scale=scale,
+						warmup=warmup,
+						iters=iters,
+						measure_chunked=measure_chunked,
+						last_successful_size=last_successful_S,
+						last_successful_latency=last_successful_t_ref,
+						last_successful_memory=last_successful_m_ref,
+						methods=methods,
+					)
 				)
-			)
+				# Track last successful S for chunking
+				if point.get("t_ref") is not None:
+					last_successful_S = S
+					last_successful_t_ref = point.get("t_ref")
+					last_successful_m_ref = point.get("m_ref")
+			except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+				if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
+					console.print(f"[yellow]S={S}: OOM during tensor allocation[/yellow]")
+					point.update({
+						"t_ref": None, "m_ref": None,
+						"t_chunked": None, "m_chunked": None,
+						"t_fast": None, "m_fast": None,
+						"t_triton_attn": None, "m_triton_attn": None,
+					})
+				else:
+					raise
+			finally:
+				if Q is not None:
+					del Q
+				if K is not None:
+					del K
+				if torch.cuda.is_available():
+					torch.cuda.empty_cache()
 			results.append(point)
-			# Track last successful S for chunking
-			if point.get("t_ref") is not None:
-				last_successful_S = S
-				last_successful_t_ref = point.get("t_ref")
-				last_successful_m_ref = point.get("m_ref")
 			progress.advance(task)
 	_print_table(console, "Non-Causal ColSum (B=1)", "S", results)
 	if generate_plots:
 		_save_and_plot(results, x_key="S", title="Non-Causal Long Sequence latency", ylabel="ms", out_dir=out_dir, filename="noncausal_latency.png", value_keys=("t_ref", "t_fast"), scale_ms=True, x_log=True)
 		_save_and_plot(results, x_key="S", title="Non-Causal Long Sequence memory", ylabel="GiB", out_dir=out_dir, filename="noncausal_memory.png", value_keys=("m_ref", "m_fast"), scale_gib=True, x_log=True)
-	_save_csv(results, os.path.join(out_dir, "noncausal.csv"))
+	_save_csv(results, os.path.join(out_dir, "noncausal.csv"), primary_key="S")
 	return results
 
 
-def sweep_causal(device: torch.device, H: int, Q_len: int, D: int, warmup: int, iters: int, out_dir: str, generate_plots: bool = False, measure_chunked: bool = True):
+def sweep_causal(device: torch.device, H: int, Q_len: int, D: int, warmup: int, iters: int, out_dir: str, generate_plots: bool = False, measure_chunked: bool = True, methods: Optional[List[str]] = None):
 	# B=1, Q_len=128 fixed, K_len up to 128K
 	K_values = [16384, 32768, 65536, 131072, 262144]
 	results: List[Dict[str, Optional[float]]] = []
 	console = Console()
 	console.rule(f"[bold]Causal[/] B=1, Q_len={Q_len}, H={H}, D={D}")
+	# Print the swept key length (sequence length) for terminal/pytest
+	import sys
 	last_successful_K = None
 	last_successful_t_ref = None
 	last_successful_m_ref = None
 	with Progress("[progress.description]{task.description}", BarColumn(), "{task.completed}/{task.total}", TimeElapsedColumn(), TimeRemainingColumn(), transient=True) as progress:
 		task = progress.add_task("Benchmarking", total=len(K_values))
 		for K_len in K_values:
-			dtype = torch.float16 if device.type == "cuda" else torch.float32
-			Q = torch.randn(1, H, Q_len, D, device=device, dtype=dtype)
-			K = torch.randn(1, H, K_len, D, device=device, dtype=dtype)
-			scale = 1.0 / math.sqrt(D)
+			print(f"[size] K_len={K_len}, Q_len={Q_len}", file=sys.stderr, flush=True)
 			point = {"B": 1, "H": H, "Q_len": Q_len, "K_len": K_len, "D": D}
-			point.update(
-				run_point(
-					is_causal=True,
-					Q=Q,
-					K=K,
-					scale=scale,
-					warmup=warmup,
-					iters=iters,
-					measure_chunked=measure_chunked,
-					last_successful_size=last_successful_K,
-					last_successful_latency=last_successful_t_ref,
-					last_successful_memory=last_successful_m_ref,
+			Q, K = None, None
+			try:
+				if torch.cuda.is_available():
+					torch.cuda.synchronize()
+					torch.cuda.empty_cache()
+				dtype = torch.float16 if device.type == "cuda" else torch.float32
+				Q = torch.randn(1, H, Q_len, D, device=device, dtype=dtype)
+				K = torch.randn(1, H, K_len, D, device=device, dtype=dtype)
+				scale = 1.0 / math.sqrt(D)
+				point.update(
+					run_point(
+						is_causal=True,
+						Q=Q,
+						K=K,
+						scale=scale,
+						warmup=warmup,
+						iters=iters,
+						measure_chunked=measure_chunked,
+						last_successful_size=last_successful_K,
+						last_successful_latency=last_successful_t_ref,
+						last_successful_memory=last_successful_m_ref,
+						methods=methods,
+					)
 				)
-			)
+				# Track last successful K_len for chunking
+				if point.get("t_ref") is not None:
+					last_successful_K = K_len
+					last_successful_t_ref = point.get("t_ref")
+					last_successful_m_ref = point.get("m_ref")
+			except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+				if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
+					console.print(f"[yellow]K_len={K_len}: OOM during tensor allocation[/yellow]")
+					point.update({
+						"t_ref": None, "m_ref": None,
+						"t_chunked": None, "m_chunked": None,
+						"t_fast": None, "m_fast": None,
+						"t_triton_attn": None, "m_triton_attn": None,
+					})
+				else:
+					raise
+			finally:
+				if Q is not None:
+					del Q
+				if K is not None:
+					del K
+				if torch.cuda.is_available():
+					torch.cuda.empty_cache()
 			results.append(point)
-			# Track last successful K_len for chunking
-			if point.get("t_ref") is not None:
-				last_successful_K = K_len
-				last_successful_t_ref = point.get("t_ref")
-				last_successful_m_ref = point.get("m_ref")
 			progress.advance(task)
 	_print_table(console, "Causal (Q=128)", "K_len", results)
 	if generate_plots:
 		_save_and_plot(results, x_key="K_len", title="Causal (Q=128) latency", ylabel="ms", out_dir=out_dir, filename="causal_latency.png", value_keys=("t_ref", "t_fast"), scale_ms=True, x_log=True)
 		_save_and_plot(results, x_key="K_len", title="Causal (Q=128) memory", ylabel="GiB", out_dir=out_dir, filename="causal_memory.png", value_keys=("m_ref", "m_fast"), scale_gib=True, x_log=True)
-	_save_csv(results, os.path.join(out_dir, "causal.csv"))
+	_save_csv(results, os.path.join(out_dir, "causal.csv"), primary_key="K_len")
 	return results
 
 
-def _save_csv(rows: List[Dict[str, Optional[float]]], path: str):
+def sweep_causal_batched(device: torch.device, H: int, Q_len: int, K_len: int, D: int, warmup: int, iters: int, out_dir: str, generate_plots: bool = False, measure_chunked: bool = True, methods: Optional[List[str]] = None):
+	"""Causal attention with varying batch size (fixed Q_len and K_len)."""
+	# Smaller batch range due to large K_len (65536) causing high memory usage
+	B_values = [1, 2, 4, 8, 16, 32]
+	results: List[Dict[str, Optional[float]]] = []
+	console = Console()
+	console.rule(f"[bold]Causal Batched[/] Q_len={Q_len}, K_len={K_len}, H={H}, D={D}")
+	# Print fixed lengths for terminal/pytest visibility
+	import sys
+	print(f"[size] K_len={K_len}, Q_len={Q_len}", file=sys.stderr, flush=True)
+	last_successful_B = None
+	last_successful_t_ref = None
+	last_successful_m_ref = None
+	with Progress("[progress.description]{task.description}", BarColumn(), "{task.completed}/{task.total}", TimeElapsedColumn(), TimeRemainingColumn(), transient=True) as progress:
+		task = progress.add_task("Benchmarking", total=len(B_values))
+		for B in B_values:
+			point = {"B": B, "H": H, "Q_len": Q_len, "K_len": K_len, "D": D}
+			Q, K = None, None
+			try:
+				if torch.cuda.is_available():
+					torch.cuda.synchronize()
+					torch.cuda.empty_cache()
+				dtype = torch.float16 if device.type == "cuda" else torch.float32
+				Q = torch.randn(B, H, Q_len, D, device=device, dtype=dtype)
+				K = torch.randn(B, H, K_len, D, device=device, dtype=dtype)
+				scale = 1.0 / math.sqrt(D)
+				point.update(
+					run_point(
+						is_causal=True,
+						Q=Q,
+						K=K,
+						scale=scale,
+						warmup=warmup,
+						iters=iters,
+						measure_chunked=measure_chunked,
+						last_successful_size=last_successful_B,
+						last_successful_latency=last_successful_t_ref,
+						last_successful_memory=last_successful_m_ref,
+						methods=methods,
+					)
+				)
+				if point.get("t_ref") is not None:
+					last_successful_B = B
+					last_successful_t_ref = point.get("t_ref")
+					last_successful_m_ref = point.get("m_ref")
+			except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+				if "out of memory" in str(e).lower() or isinstance(e, torch.cuda.OutOfMemoryError):
+					console.print(f"[yellow]B={B}: OOM during tensor allocation[/yellow]")
+					point.update({
+						"t_ref": None, "m_ref": None,
+						"t_chunked": None, "m_chunked": None,
+						"t_fast": None, "m_fast": None,
+						"t_triton_attn": None, "m_triton_attn": None,
+					})
+				else:
+					raise
+			finally:
+				if Q is not None:
+					del Q
+				if K is not None:
+					del K
+				if torch.cuda.is_available():
+					torch.cuda.empty_cache()
+			results.append(point)
+			progress.advance(task)
+	_print_table(console, f"Causal Batched (Q={Q_len}, K={K_len})", "B", results)
+	if generate_plots:
+		_save_and_plot(results, x_key="B", title=f"Causal Batched (Q={Q_len}, K={K_len}) latency", ylabel="ms", out_dir=out_dir, filename="causal_batched_latency.png", value_keys=("t_ref", "t_fast"), scale_ms=True)
+		_save_and_plot(results, x_key="B", title=f"Causal Batched (Q={Q_len}, K={K_len}) memory", ylabel="GiB", out_dir=out_dir, filename="causal_batched_memory.png", value_keys=("m_ref", "m_fast"), scale_gib=True)
+	_save_csv(results, os.path.join(out_dir, "causal_batched.csv"), primary_key="B")
+	return results
+
+
+def _save_csv(rows: List[Dict[str, Optional[float]]], path: str, primary_key: str = None):
+	"""Save results to CSV, merging with existing data if present.
+	
+	Args:
+		rows: List of result dictionaries
+		path: Path to save the CSV
+		primary_key: The key to use as the unique identifier for merging rows.
+		             If None, uses the first key in the first row.
+	"""
 	os.makedirs(os.path.dirname(path), exist_ok=True)
 	if not rows:
 		return
-	keys = list(rows[0].keys())
+	
+	# Determine the primary key
+	new_keys = list(rows[0].keys())
+	if primary_key is None:
+		primary_key = new_keys[0]  # First column is typically the x-axis key
+	
+	# Try to load existing CSV and merge
+	existing_data = {}
+	all_keys = set(new_keys)
+	if os.path.exists(path):
+		try:
+			with open(path, "r", newline="") as f:
+				reader = csv.DictReader(f)
+				for row in reader:
+					pk_val = row[primary_key]
+					# Convert numeric strings back to appropriate types
+					parsed_row = {}
+					for k, v in row.items():
+						if v == '' or v == 'None':
+							parsed_row[k] = None
+						else:
+							try:
+								parsed_row[k] = float(v) if '.' in v else int(v)
+							except ValueError:
+								parsed_row[k] = v
+					existing_data[pk_val] = parsed_row
+					all_keys.update(row.keys())
+		except Exception:
+			pass  # If reading fails, just overwrite
+	
+	# Merge new rows into existing data
+	for row in rows:
+		pk_val = str(row[primary_key])
+		if pk_val in existing_data:
+			# Update only non-None values from new row
+			for k, v in row.items():
+				if v is not None:
+					existing_data[pk_val][k] = v
+		else:
+			existing_data[pk_val] = row.copy()
+		all_keys.update(row.keys())
+	
+	# Sort rows by primary key (numeric sort if possible)
+	try:
+		sorted_keys = sorted(existing_data.keys(), key=lambda x: float(x))
+	except ValueError:
+		sorted_keys = sorted(existing_data.keys())
+	
+	# Write merged data
+	fieldnames = [primary_key] + [k for k in sorted(all_keys) if k != primary_key]
 	with open(path, "w", newline="") as f:
-		w = csv.DictWriter(f, fieldnames=keys)
+		w = csv.DictWriter(f, fieldnames=fieldnames)
 		w.writeheader()
-		for r in rows:
-			w.writerow(r)
+		for pk_val in sorted_keys:
+			w.writerow(existing_data[pk_val])
 
 
 def _save_and_plot(rows: List[Dict[str, Optional[float]]], x_key: str, title: str, ylabel: str, out_dir: str, filename: str, value_keys: Tuple[str, str], scale_ms: bool = False, scale_mib: bool = False, scale_gib: bool = False, x_log: bool = False):
@@ -481,22 +797,25 @@ def rows_to_series(rows: List[Dict[str, Optional[float]]], key: str) -> List[Opt
 def _print_table(console: Console, title: str, x_key: str, rows: List[Dict[str, Optional[float]]]) -> None:
 	table = Table(title=title)
 	table.add_column(x_key, justify="right", style="bold")
-	table.add_column("torch ms", justify="right")
-	table.add_column("chunked ms", justify="right")
-	table.add_column("triton ms", justify="right")
-	table.add_column("speedup", justify="right")
-	table.add_column("torch GiB", justify="right")
-	table.add_column("triton GiB", justify="right")
-	table.add_column("mem savings", justify="right")
+	table.add_column("PyTorch Naive", justify="right")
+	table.add_column("Chunked", justify="right")
+	table.add_column("Flash-ColSum", justify="right")
+	table.add_column("Triton FA2", justify="right")
+	table.add_column("Speedup", justify="right")
+	table.add_column("Naive GiB", justify="right")
+	table.add_column("ColSum GiB", justify="right")
+	table.add_column("Mem Savings", justify="right")
 	for r in rows:
 		xv = str(r.get(x_key))
 		t_ref = r.get("t_ref"); t_chunked = r.get("t_chunked"); t_fast = r.get("t_fast")
+		t_triton_attn = r.get("t_triton_attn")
 		m_ref = r.get("m_ref"); m_chunked = r.get("m_chunked"); m_fast = r.get("m_fast")
 		t_ref_s = f"{t_ref*1000:.2f}" if t_ref is not None else "OOM"
 		t_chunked_s = f"{t_chunked*1000:.2f}" if t_chunked is not None else "-"
 		t_fast_s = f"{t_fast*1000:.2f}" if t_fast is not None else "OOM"
+		t_triton_attn_s = f"{t_triton_attn*1000:.2f}" if t_triton_attn is not None else "OOM"
 		
-		# Compare triton to either naive or chunked (whichever is available)
+		# Compare flash_colsum to either naive or chunked (whichever is available)
 		t_baseline = t_ref if t_ref is not None else t_chunked
 		speed = f"{(t_baseline/t_fast):.2f}x" if (t_baseline and t_fast and t_fast > 0) else "-"
 		
@@ -509,7 +828,7 @@ def _print_table(console: Console, title: str, x_key: str, rows: List[Dict[str, 
 		
 		# Memory savings: how much LESS memory flash-colsum uses (m_ref / m_fast)
 		m_savings = f"{(m_ref/m_fast):.2f}x" if (m_ref and m_fast and m_fast > 0) else "-"
-		table.add_row(xv, t_ref_s, t_chunked_s, t_fast_s, speed, m_ref_s, m_fast_s, m_savings)
+		table.add_row(xv, t_ref_s, t_chunked_s, t_fast_s, t_triton_attn_s, speed, m_ref_s, m_fast_s, m_savings)
 	console.print(table)
 
 
@@ -518,28 +837,57 @@ def create_unified_plot(
 	noncausal_results: List[Dict[str, Optional[float]]],
 	causal_results: List[Dict[str, Optional[float]]],
 	out_dir: str,
-	filename: str = "unified_benchmark.png"
+	filename: str = "unified_benchmark.png",
+	causal_batched_results: Optional[List[Dict[str, Optional[float]]]] = None,
 ):
 	"""
-	Create a unified 3x2 plot with latency (top row) and memory (bottom row)
-	for all three benchmark types. Includes chunked baseline for OOM cases.
+	Create a unified plot with latency (top row) and memory (bottom row)
+	for all benchmark types. Includes chunked baseline for OOM cases.
+	
+	Column order: batched non-causal, non-causal, batched causal, causal
 	"""
-	# Slightly shorter vertically for better density
-	fig, axes = plt.subplots(2, 3, figsize=(16, 6.7))
+	# Determine number of columns based on whether causal_batched is provided
+	num_cols = 4 if causal_batched_results else 3
+	fig, axes = plt.subplots(2, num_cols, figsize=(5.5 * num_cols, 6.7))
 	
-	# Titles for each column
-	titles = [
-		"Batched Non-Causal ColSum\n(Sequence Length: 1024)",
-		"Non-Causal ColSum\n(Batch Size: 1)",
-		"Causal ColSum\n(Query Length: 128)"
-	]
-	
-	# Data configuration for each column: (results, x_key, x_label, x_log)
-	configs = [
-		(noncausal_batched_results, "B", "b = batch size", False),
-		(noncausal_results, "S", "s = sequence length", True),
-		(causal_results, "K_len", "s = key length (K_len)", True)
-	]
+	# Titles for each column - order: batched non-causal, non-causal, batched causal, causal
+	# Square = Q_len == K_len, Non-Square = Q_len != K_len  
+	# Subtitle shows params + square/non-square in light style
+	if causal_batched_results:
+		titles = [
+			"Batched Non-Causal",
+			"Non-Causal",
+			"Batched Causal",
+			"Causal",
+		]
+		subtitles = [
+			"S=1024  (square)",
+			"B=1  (square)",
+			"Q=128, K=65536  (non-square)",
+			"Q=128  (non-square)",
+		]
+		configs = [
+			(noncausal_batched_results, "B", "b = batch size", False),
+			(noncausal_results, "S", "s = sequence length", True),
+			(causal_batched_results, "B", "b = batch size", False),
+			(causal_results, "K_len", "k = key length", True),
+		]
+	else:
+		titles = [
+			"Batched Non-Causal",
+			"Non-Causal",
+			"Causal",
+		]
+		subtitles = [
+			"S=1024  (square)",
+			"B=1  (square)",
+			"Q=128  (non-square)",
+		]
+		configs = [
+			(noncausal_batched_results, "B", "b = batch size", False),
+			(noncausal_results, "S", "s = sequence length", True),
+			(causal_results, "K_len", "k = key length", True),
+		]
 	
 	for col, (results, x_key, x_label, x_log) in enumerate(configs):
 		if not results:
@@ -551,23 +899,36 @@ def create_unified_plot(
 		t_ref = [r.get("t_ref") for r in results]
 		t_chunked = [r.get("t_chunked") for r in results]
 		t_fast = [r.get("t_fast") for r in results]
+		t_triton_attn = [r.get("t_triton_attn") for r in results]
 		
 		# Extract memory data (bottom row)
 		m_ref = [r.get("m_ref") for r in results]
 		m_chunked = [r.get("m_chunked") for r in results]
 		m_fast = [r.get("m_fast") for r in results]
+		m_triton_attn = [r.get("m_triton_attn") for r in results]
 		
 		# Convert to ms and GiB
 		t_ref_ms = [v * 1000 if v is not None else None for v in t_ref]
 		t_chunked_ms = [v * 1000 if v is not None else None for v in t_chunked]
 		t_fast_ms = [v * 1000 if v is not None else None for v in t_fast]
+		t_triton_attn_ms = [v * 1000 if v is not None else None for v in t_triton_attn]
 		m_ref_gib = [v / (1024**3) if v is not None else None for v in m_ref]
 		m_chunked_gib = [v / (1024**3) if v is not None else None for v in m_chunked]
 		m_fast_gib = [v / (1024**3) if v is not None else None for v in m_fast]
+		m_triton_attn_gib = [v / (1024**3) if v is not None else None for v in m_triton_attn]
 		
 		# Plot latency (top row)
 		ax_lat = axes[0, col]
-		ax_lat.set_title(titles[col], fontweight='bold', pad=10)
+		# Two-line title: bold main title, light grey italic subtitle
+		ax_lat.set_title(f"{titles[col]}\n{subtitles[col]}", fontweight='bold', pad=10)
+		# Override the subtitle styling by using text directly
+		ax_lat.title.set_fontweight('bold')
+		# Create a custom title with mixed styling
+		ax_lat.set_title("")  # Clear default
+		ax_lat.text(0.5, 1.08, titles[col], transform=ax_lat.transAxes, 
+				   fontsize=11, fontweight='bold', ha='center', va='bottom')
+		ax_lat.text(0.5, 1.02, subtitles[col], transform=ax_lat.transAxes,
+				   fontsize=9, fontstyle='italic', color='#666666', ha='center', va='bottom')
 		
 		# Find first OOM point for naive
 		first_oom_idx = None
@@ -581,7 +942,7 @@ def create_unified_plot(
 		y_ref_lat = [y for y in t_ref_ms if y is not None]
 		if x_ref_lat and y_ref_lat:
 			ax_lat.plot(x_ref_lat, y_ref_lat, marker='o', linewidth=2, markersize=6, 
-					   color=COLOR_NAIVE, label='Naive (PyTorch)', zorder=3)
+					   color=COLOR_NAIVE, label='PyTorch Naive ColSum', zorder=3)
 		
 		# Plot chunked baseline (from first OOM onwards)
 		if first_oom_idx is not None:
@@ -603,7 +964,7 @@ def create_unified_plot(
 					color=COLOR_NAIVE,
 					linestyle='--',
 					alpha=0.7,
-					label='Naive Chunked (PyTorch)',
+					label='PyTorch Naive (Chunked) ColSum',
 					zorder=2,
 				)
 			# Mark the OOM boundary as a vertical line at the last non-OOM point,
@@ -623,7 +984,40 @@ def create_unified_plot(
 		y_fast_lat = [y for y in t_fast_ms if y is not None]
 		if x_fast_lat and y_fast_lat:
 			ax_lat.plot(x_fast_lat, y_fast_lat, marker='s', linewidth=2, markersize=6,
-					   color=COLOR_OURS, label='Flash-ColSum (Triton)', zorder=4)
+					   color=COLOR_OURS, label='Flash-ColSum', zorder=4)
+		
+		# Find first OOM point for triton attention
+		first_triton_oom_idx = None
+		for i, t in enumerate(t_triton_attn_ms):
+			if t is None:
+				first_triton_oom_idx = i
+				break
+		
+		# Plot triton attention (standard flash attention for reference)
+		x_triton_attn_lat = [x for x, y in zip(x_vals, t_triton_attn_ms) if y is not None]
+		y_triton_attn_lat = [y for y in t_triton_attn_ms if y is not None]
+		if x_triton_attn_lat and y_triton_attn_lat:
+			ax_lat.plot(x_triton_attn_lat, y_triton_attn_lat, marker='^', linewidth=2, markersize=6,
+					   color=COLOR_TRITON_ATTN, label='Triton FA2', zorder=3, linestyle='--')
+		
+		# Mark triton attention OOM boundary
+		if first_triton_oom_idx is not None:
+			if first_triton_oom_idx > 0 and t_triton_attn_ms[first_triton_oom_idx - 1] is not None:
+				# OOM after some successful points - draw line at last successful point
+				x_triton_boundary = x_vals[first_triton_oom_idx - 1]
+			elif first_triton_oom_idx == 0:
+				# OOM at first point - draw line at first x value
+				x_triton_boundary = x_vals[0]
+			else:
+				x_triton_boundary = None
+			if x_triton_boundary is not None:
+				ax_lat.axvline(
+					x_triton_boundary,
+					color=COLOR_TRITON_ATTN,
+					linestyle=':',
+					alpha=0.7,
+					linewidth=2.0,
+				)
 		
 		if x_log:
 			ax_lat.set_xscale('log', base=2)
@@ -651,6 +1045,36 @@ def create_unified_plot(
 				alpha=0.9,
 			)
 		
+		# Draw triton attention OOM label
+		if first_triton_oom_idx is not None:
+			if first_triton_oom_idx > 0 and t_triton_attn_ms[first_triton_oom_idx - 1] is not None:
+				x_triton_boundary = x_vals[first_triton_oom_idx - 1]
+			elif first_triton_oom_idx == 0:
+				x_triton_boundary = x_vals[0]
+			else:
+				x_triton_boundary = None
+			# Only show label if different from naive OOM point (to avoid overlap)
+			show_label = x_triton_boundary is not None
+			if show_label and first_oom_idx is not None and first_oom_idx > 0:
+				naive_boundary = x_vals[first_oom_idx - 1]
+				if x_triton_boundary == naive_boundary:
+					show_label = False
+			if show_label and x_triton_boundary is not None:
+				ax_lat.annotate(
+					"OOM",
+					xy=(x_triton_boundary, 0.3),
+					xycoords=("data", "axes fraction"),
+					xytext=(8, 0),                    # 8 px to the right
+					textcoords="offset points",
+					color=COLOR_TRITON_ATTN,
+					fontweight="bold",
+					rotation=90,
+					va="center",
+					ha="center",
+					fontsize=9,
+					alpha=0.9,
+				)
+		
 		# Plot memory (bottom row)
 		ax_mem = axes[1, col]
 		
@@ -659,7 +1083,7 @@ def create_unified_plot(
 		y_ref_mem = [y for y in m_ref_gib if y is not None]
 		if x_ref_mem and y_ref_mem:
 			ax_mem.plot(x_ref_mem, y_ref_mem, marker='o', linewidth=2, markersize=6,
-					   color=COLOR_NAIVE, label='Naive (PyTorch)', zorder=3)
+					   color=COLOR_NAIVE, label='PyTorch Naive ColSum', zorder=3)
 		
 		# Plot chunked baseline memory (from first OOM onwards)
 		if first_oom_idx is not None:
@@ -681,7 +1105,7 @@ def create_unified_plot(
 					color=COLOR_NAIVE,
 					linestyle='--',
 					alpha=0.7,
-					label='Naive Chunked (PyTorch)',
+					label='PyTorch Naive (Chunked) ColSum',
 					zorder=2,
 				)
 			# Vertical OOM boundary at last non-OOM point, even if chunked is missing/OOM
@@ -700,7 +1124,31 @@ def create_unified_plot(
 		y_fast_mem = [y for y in m_fast_gib if y is not None]
 		if x_fast_mem and y_fast_mem:
 			ax_mem.plot(x_fast_mem, y_fast_mem, marker='s', linewidth=2, markersize=6,
-					   color=COLOR_OURS, label='Flash-ColSum (Triton)', zorder=4)
+					   color=COLOR_OURS, label='Flash-ColSum', zorder=4)
+		
+		# Plot triton attention memory
+		x_triton_attn_mem = [x for x, y in zip(x_vals, m_triton_attn_gib) if y is not None]
+		y_triton_attn_mem = [y for y in m_triton_attn_gib if y is not None]
+		if x_triton_attn_mem and y_triton_attn_mem:
+			ax_mem.plot(x_triton_attn_mem, y_triton_attn_mem, marker='^', linewidth=2, markersize=6,
+					   color=COLOR_TRITON_ATTN, label='Triton FA2', zorder=3, linestyle='--')
+		
+		# Mark triton attention OOM boundary on memory plot
+		if first_triton_oom_idx is not None:
+			if first_triton_oom_idx > 0 and m_triton_attn_gib[first_triton_oom_idx - 1] is not None:
+				x_triton_boundary = x_vals[first_triton_oom_idx - 1]
+			elif first_triton_oom_idx == 0:
+				x_triton_boundary = x_vals[0]
+			else:
+				x_triton_boundary = None
+			if x_triton_boundary is not None:
+				ax_mem.axvline(
+					x_triton_boundary,
+					color=COLOR_TRITON_ATTN,
+					linestyle=':',
+					alpha=0.7,
+					linewidth=2.0,
+				)
 		
 		if x_log:
 			ax_mem.set_xscale('log', base=2)
@@ -728,21 +1176,35 @@ def create_unified_plot(
 				alpha=0.9,
 			)
 	
-	# Single, consolidated legend for the entire figure
-	handles_all: List = []
-	labels_all: List[str] = []
+	# Single, consolidated legend for the entire figure with specific ordering
+	# Order: PyTorch Naive ColSum, PyTorch Naive (Chunked) ColSum, Triton FA2, Flash-ColSum
+	desired_order = [
+		'PyTorch Naive ColSum',
+		'PyTorch Naive (Chunked) ColSum', 
+		'Triton FA2',
+		'Flash-ColSum',
+	]
+	handles_dict = {}
 	for ax in axes.flatten():
 		h, l = ax.get_legend_handles_labels()
 		for handle, label in zip(h, l):
-			if label not in labels_all:
-				handles_all.append(handle)
-				labels_all.append(label)
-	if handles_all:
+			if label not in handles_dict:
+				handles_dict[label] = handle
+	
+	# Build ordered handles/labels
+	handles_ordered = []
+	labels_ordered = []
+	for label in desired_order:
+		if label in handles_dict:
+			handles_ordered.append(handles_dict[label])
+			labels_ordered.append(label)
+	
+	if handles_ordered:
 		fig.legend(
-			handles_all,
-			labels_all,
+			handles_ordered,
+			labels_ordered,
 			loc="upper center",
-			ncol=len(labels_all),
+			ncol=len(labels_ordered),
 			frameon=False,
 			bbox_to_anchor=(0.5, 1.05),
 		)
@@ -754,9 +1216,9 @@ def create_unified_plot(
 	plt.close()
 	print(f"Saved unified plot to: {out_path}")
 
-def sweep_all_unified(device: torch.device, warmup: int = None, iters: int = None, out_dir: str = "benchmarks/out"):
+def sweep_all_unified(device: torch.device, warmup: int = None, iters: int = None, out_dir: str = "benchmarks/out", methods: Optional[List[str]] = None):
 	"""
-	Run all three benchmark sweeps and generate a unified 3x2 plot.
+	Run all four benchmark sweeps and generate a unified plot.
 	Uses appropriate warmup/iters for each benchmark type if not specified.
 	"""
 	console = Console()
@@ -771,33 +1233,42 @@ def sweep_all_unified(device: torch.device, warmup: int = None, iters: int = Non
 	text_iters = iters if iters is not None else 1000
 	
 	# Run non-causal batched (S=1024, vary B) - no individual plots
-	console.print("\n[bold]1/3: Non-Causal Batched[/bold]")
+	console.print("\n[bold]1/4: Non-Causal Batched[/bold]")
 	console.print(f"[dim]warmup={vision_warmup}, iters={vision_iters}[/dim]")
 	noncausal_batched_results = sweep_noncausal_batched(
 		device=device, H=16, S=1024, D=64, 
-		warmup=vision_warmup, iters=vision_iters, out_dir=out_dir, generate_plots=False
+		warmup=vision_warmup, iters=vision_iters, out_dir=out_dir, generate_plots=False, methods=methods
 	)
 	
 	# Run non-causal (B=1, vary S) - no individual plots
-	console.print("\n[bold]2/3: Non-Causal ColSum (B=1)[/bold]")
+	console.print("\n[bold]2/4: Non-Causal ColSum (B=1)[/bold]")
 	console.print(f"[dim]warmup={vision_warmup}, iters={vision_iters}[/dim]")
 	noncausal_results = sweep_noncausal(
 		device=device, H=16, D=64, 
-		warmup=vision_warmup, iters=vision_iters, out_dir=out_dir, generate_plots=False
+		warmup=vision_warmup, iters=vision_iters, out_dir=out_dir, generate_plots=False, methods=methods
 	)
 	
 	# Run causal (B=1, Q_len=128, vary K_len) - no individual plots
-	console.print("\n[bold]3/3: Causal[/bold]")
+	console.print("\n[bold]3/4: Causal[/bold]")
 	console.print(f"[dim]warmup={text_warmup}, iters={text_iters}[/dim]")
 	causal_results = sweep_causal(
 		device=device, H=32, Q_len=128, D=128, 
-		warmup=text_warmup, iters=text_iters, out_dir=out_dir, generate_plots=False
+		warmup=text_warmup, iters=text_iters, out_dir=out_dir, generate_plots=False, methods=methods
+	)
+	
+	# Run causal batched (Q_len=128, K_len=65536, vary B) - no individual plots
+	console.print("\n[bold]4/4: Causal Batched[/bold]")
+	console.print(f"[dim]warmup={text_warmup}, iters={text_iters}[/dim]")
+	causal_batched_results = sweep_causal_batched(
+		device=device, H=32, Q_len=128, K_len=65536, D=128, 
+		warmup=text_warmup, iters=text_iters, out_dir=out_dir, generate_plots=False, methods=methods
 	)
 	
 	# Generate unified plot
 	console.print("\n[bold green]Generating unified plot...[/bold green]")
 	create_unified_plot(noncausal_batched_results, noncausal_results, causal_results, 
-					   out_dir, filename="unified_benchmark.png")
+					   out_dir, filename="unified_benchmark.png",
+					   causal_batched_results=causal_batched_results)
 	console.print("[bold green]✓ All benchmarks complete![/bold green]\n")
 
 
@@ -807,7 +1278,9 @@ def main():
 	parser.add_argument("--warmup", type=int, default=100, help="Number of warmup iterations (default: 100 for individual sweeps, auto for --sweep all)")
 	parser.add_argument("--iters", type=int, default=100, help="Number of benchmark iterations (default: 1000 for individual sweeps, auto for --sweep all)")
 	parser.add_argument("--out", type=str, default="benchmarks/out")
-	parser.add_argument("--sweep", type=str, choices=["noncausal_batched", "noncausal", "causal", "all"], help="Run a predefined sweep and generate charts")
+	parser.add_argument("--sweep", type=str, choices=["noncausal_batched", "noncausal", "causal", "causal_batched", "all"], help="Run a predefined sweep and generate charts")
+	parser.add_argument("--method", type=str, nargs="+", choices=["naive", "flash_colsum", "triton_fa2"], 
+					   help="Run only specific methods (default: all). Options: naive, flash_colsum, triton_fa2")
 	# fallback single-point args
 	parser.add_argument("--causal", action="store_true", help="Use causal masking for single-point benchmark")
 	parser.add_argument("--B", type=int, default=8)
@@ -821,15 +1294,18 @@ def main():
 	device = torch.device(args.device)
 
 	if args.sweep:
+		methods = args.method  # Will be None if not specified (run all)
 		if args.sweep == "noncausal_batched":
-			sweep_noncausal_batched(device=device, H=args.H, S=1024, D=args.D, warmup=args.warmup, iters=args.iters, out_dir=args.out, generate_plots=True)
+			sweep_noncausal_batched(device=device, H=args.H, S=1024, D=args.D, warmup=args.warmup, iters=args.iters, out_dir=args.out, generate_plots=True, methods=methods)
 		elif args.sweep == "noncausal":
-			sweep_noncausal(device=device, H=args.H, D=args.D, warmup=args.warmup, iters=args.iters, out_dir=args.out, generate_plots=True)
+			sweep_noncausal(device=device, H=args.H, D=args.D, warmup=args.warmup, iters=args.iters, out_dir=args.out, generate_plots=True, methods=methods)
 		elif args.sweep == "causal":
-			sweep_causal(device=device, H=args.H, Q_len=128, D=args.D, warmup=args.warmup, iters=args.iters, out_dir=args.out, generate_plots=True)
+			sweep_causal(device=device, H=args.H, Q_len=128, D=args.D, warmup=args.warmup, iters=args.iters, out_dir=args.out, generate_plots=True, methods=methods)
+		elif args.sweep == "causal_batched":
+			sweep_causal_batched(device=device, H=args.H, Q_len=128, K_len=65536, D=args.D, warmup=args.warmup, iters=args.iters, out_dir=args.out, generate_plots=True, methods=methods)
 		elif args.sweep == "all":
 			# For sweep all, use per-benchmark defaults unless explicitly overridden
-			sweep_all_unified(device=device, out_dir=args.out)
+			sweep_all_unified(device=device, out_dir=args.out, methods=methods)
 		return
 
 	# Single-point fallback
@@ -845,7 +1321,7 @@ def main():
 
 	D = Q.shape[-1]
 	scale = 1.0 / math.sqrt(D)
-	res = run_point(is_causal=args.causal, Q=Q, K=K, scale=scale, warmup=args.warmup, iters=args.iters)
+	res = run_point(is_causal=args.causal, Q=Q, K=K, scale=scale, warmup=args.warmup, iters=args.iters, methods=args.method)
 	print(f"latency_ref_ms={None if res['t_ref'] is None else res['t_ref']*1000:.3f}, latency_fast_ms={None if res['t_fast'] is None else res['t_fast']*1000:.3f}")
 	print(f"mem_ref_bytes={res['m_ref']}, mem_fast_bytes={res['m_fast']}")
 

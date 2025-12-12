@@ -5,9 +5,9 @@
 [![PyPI](https://img.shields.io/pypi/v/flash-colsum)](https://pypi.org/project/flash-colsum/)
 [![License](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 
-Flash-ColSum provides efficient implementations for computing the mean attention column sum without materializing full attention matrices.
+Flash-ColSum provides efficient implementations for computing the attention column sum without materializing full attention matrices.
 
-Originally developed for [SparseVILA](https://arxiv.org/abs/2510.17777), Flash-ColSum is a general-purpose library for computing the mean column statistics of attention weights (token importance, attention analysis, etc).
+Originally developed for [SparseVILA](https://arxiv.org/abs/2510.17777), Flash-ColSum is a general-purpose library for computing the column statistics of attention weights (token importance, attention analysis, etc).
 
 ## Installation
 
@@ -27,43 +27,61 @@ pip install -e .
 
 ```python
 import torch
-from flash_colsum import flash_colsum
+from flash_colsum import flash_colsum, flash_colmean
 
-# Non-causal (ViT, BERT, etc.)
-Q = torch.randn(8, 16, 2048, 64, device="cuda", dtype=torch.float16)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+dtype = torch.float16 if device == "cuda" else torch.float32
+torch.manual_seed(0)
+
+# 1) Non-causal (square, batched)
+Q = torch.randn(8, 16, 512, 64, device=device, dtype=dtype)
 K = Q.clone()
-col_mean = flash_colsum(Q, K)  # (8, 2048)
+col_sum = flash_colsum(Q, K)           # (8, 512)
 
-# Non-causal with CLS tokens (e.g., CLIP-style, first position is CLS)
-# Average how much attention each token receives from the CLS token(s)
-cls_col_mean = flash_colsum(Q, K, cls_len=1)  # (8, 2048)
+# 2) Non-causal (non-square, B=1)
+Q = torch.randn(1, 16, 1024, 64, device=device, dtype=dtype)
+K = torch.randn(1, 16, 4096, 64, device=device, dtype=dtype)
+col_sum = flash_colsum(Q, K)           # (1, 4096)
 
-# Causal (GPT, retrieval, etc.)
-Q = torch.randn(1, 32, 128, 128, device="cuda", dtype=torch.float16)
-K = torch.randn(1, 32, 4096, 128, device="cuda", dtype=torch.float16)
-col_mean = flash_colsum(Q, K, is_causal=True)  # (1, 4096)
+# 3) Causal (right-aligned, non-square)
+Q = torch.randn(1, 32, 128, 128, device=device, dtype=dtype)
+K = torch.randn(1, 32, 4096, 128, device=device, dtype=dtype)
+col_sum = flash_colsum(Q, K, is_causal=True)      # (1, 4096)
+
+# 4) Causal (right-aligned, square)
+Q = torch.randn(1, 8, 512, 64, device=device, dtype=dtype)
+K = torch.randn(1, 8, 512, 64, device=device, dtype=dtype)
+col_sum = flash_colsum(Q, K, is_causal=True)      # (1, 512)
+
 ```
 
 ## API
 
-### `flash_colsum(query, key, scale=None, is_causal=False, cls_len=None)`
+### `flash_colsum(query, key, scale=None, is_causal=False)`
 
-Compute attention column means efficiently without materializing full attention matrix.
+Compute the attention column sum efficiently without materializing the full attention matrix.
 
 **Parameters:**
 - `query` (Tensor): Query tensor `(B, H, S, D)` or `(1, H, Q_len, D)` for causal
 - `key` (Tensor): Key tensor (same shape as query for non-causal), or `K_len >= Q_len` for causal
 - `scale` (float, optional): Attention scale. Default: `1/sqrt(D)`
 - `is_causal` (bool): Apply causal masking. Default: `False`
-- `cls_len` (int, optional): In the non-causal case, average only over the first `cls_len`
-  query positions (e.g., CLS tokens). If `None`, averages over all query positions.
 
 **Returns:**
 - `Tensor`:
-  - Non-causal: `(B, S)` mean per key position
-    - with `cls_len=None`: averaged over all query positions and heads
-    - with `cls_len>0`: averaged over the first `cls_len` query positions and all heads
-  - Causal: `(1, K_len)` mean per key position (no `cls_len` support)
+  - Non-causal: `(B, S)` column sum per key position
+  - Causal (right-aligned): `(1, K_len)` column sum per key position
+
+Notes:
+- Causal masking is right-aligned: for non-square inputs, later keys see fewer queries.
+- Column means can be obtained via the function below.
+
+### `flash_colmean(query, key, scale=None, is_causal=False)`
+
+Syntactic sugar for computing the attention mean column sum, implemented as a thin wrapper over `flash_colsum` with the correct normalization for each key position (including non-square, right-aligned causal cases).
+
+**Returns:**
+- `Tensor` with the same shape as `flash_colsum` but normalized to produce per-key means.
 
 ## Performance
 
