@@ -6,7 +6,7 @@
 
 **Flash-ColSum** provides highly optimized Triton kernels for computing the column sums (or means) of the attention matrix **without materializing the full $O(N^2)$ attention weights**.
 
-This primitive is essential for efficient KV-cache pruning, token importance estimation, and attention analysis in Large Language Models (LLMs) and Vision-Language Models (VLMs), such as [SparseVILA](https://arxiv.org/abs/2510.17777).
+This primitive is essential for **KV-cache pruning** and **attention analysis** in Large Language Models (LLMs) and Vision-Language Models (VLMs). It powers the visual token pruning in [SparseVILA](https://arxiv.org/abs/2510.17777).
 
 ## Highlights
 
