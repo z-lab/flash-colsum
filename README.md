@@ -10,7 +10,7 @@ This primitive is essential for efficient KV-cache pruning, token importance est
 
 ## Highlights
 
-- **🚀 Fast & Efficient**: Fused kernels compute column statistics in **$O(N)$ memory**, enabling 128k+ context lengths.
+- **🚀 Efficient**: Fused kernels compute column statistics in **$O(N)$ memory**, enabling 128k+ context lengths.
 - **🧩 Flexible**: Supports **causal** and **non-causal** attention with irregular shapes ($M \neq N$).
 - **✅ Exact**: Uses online softmax for numerical precision and correct causal masking.
 
