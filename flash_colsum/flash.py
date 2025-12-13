@@ -26,6 +26,7 @@ def _attn_qk_softmax_lse_update(
     BLOCK_N: tl.constexpr,
     ON_BAND: tl.constexpr,
 ):
+    C = max(0, N - M)
     k_block_ptr = tl.advance(k_block_ptr, (0, lo))
 
     indices_m = start_m + offsets_m
@@ -39,7 +40,7 @@ def _attn_qk_softmax_lse_update(
 
         qk = tl.dot(q, k) * scale
         if ON_BAND:
-            qk = tl.where(indices_m[:, None] >= indices_n[None, :], qk, -INF)
+            qk = tl.where(indices_m[:, None] + C >= indices_n[None, :], qk, -INF)
         qk = tl.where(indices_n[None, :] < N, qk, -INF)
 
         m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
@@ -68,6 +69,7 @@ def _attn_colsum_accumulate(
     BLOCK_N: tl.constexpr,
     ON_BAND: tl.constexpr,
 ):
+    C = max(0, N - M)
     k_block_ptr = tl.advance(k_block_ptr, (0, lo))
 
     indices_m = start_m + offsets_m
@@ -82,9 +84,9 @@ def _attn_colsum_accumulate(
 
         qk = tl.dot(q, k) * scale
         if ON_BAND:
-            qk = tl.where(indices_m[:, None] >= indices_n[None, :], qk, -INF)
+            qk = tl.where(indices_m[:, None] + C >= indices_n[None, :], qk, -INF)
         qk = tl.where(indices_n[None, :] < N, qk, -INF)
-        qk = tl.where(indices_m[:, None] - tl.maximum(N - M, 0) < M, qk, -INF)
+        qk = tl.where(indices_m[:, None] < M, qk, -INF)
 
         p = tl.exp2(qk - lse[:, None])
         o = tl.sum(p, axis=0)
@@ -92,13 +94,8 @@ def _attn_colsum_accumulate(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=3),
-        # triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=4),
-        # triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=8, num_stages=4),
-        # triton.Config({"BLOCK_M": 32, "BLOCK_N": 128}, num_warps=4, num_stages=3),
-    ],
-    key=["D", "CASUAL"],
+    configs=[triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=3)],
+    key=["D", "CAUSAL"],
 )
 @triton.jit
 def _flash_colsum_kernel(
@@ -160,13 +157,10 @@ def _flash_colsum_kernel(
     m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
 
-    # Right-aligned causal shift
     if CAUSAL:
-        start_m += tl.maximum(N - M, 0)
-
-    if CAUSAL:
-        band_start = (start_m // BLOCK_N) * BLOCK_N
-        band_end = tl.minimum(tl.cdiv(start_m + BLOCK_M, BLOCK_N) * BLOCK_N, N)
+        C = max(0, N - M)
+        band_start = ((start_m + C) // BLOCK_N) * BLOCK_N
+        band_end = tl.minimum(tl.cdiv(start_m + C + BLOCK_M, BLOCK_N) * BLOCK_N, N)
 
     l_i, m_i = _attn_qk_softmax_lse_update(
         l_i,
@@ -243,7 +237,6 @@ def _flash_colsum(
 ) -> torch.Tensor:
     b, h, m, d = q.shape
     _, _, n, _ = k.shape
-
     o = torch.zeros((b * h, n), device=q.device, dtype=torch.float32)
     _flash_colsum_kernel[lambda config: (triton.cdiv(m, config["BLOCK_M"]), b * h)](
         q,
@@ -302,16 +295,13 @@ def flash_colsum(
     """
     if not query.is_cuda or not key.is_cuda:
         raise ValueError("Query and key tensors must be on CUDA device.")
-
     if not all(query.shape[k] == key.shape[k] for k in [0, 1, 3]):
         raise ValueError(
             f"Query and key tensors must have same batch size, number of heads, and head dimension. "
             f"Got query shape: {query.shape}, key shape: {key.shape}."
         )
-
     if scale is None:
         scale = 1 / math.sqrt(query.shape[-1])
-
     return _flash_colsum(query, key, is_causal=is_causal, scale=scale)
 
 
@@ -351,21 +341,12 @@ def flash_colmean(
         A tensor of shape (B, N) containing the mean attention weight for each
         key position, averaged over all queries and heads.
     """
-    _, h, m, _ = query.shape
-    _, _, n, _ = key.shape
-
-    output = flash_colsum(
-        query,
-        key,
-        is_causal=is_causal,
-        scale=scale,
-    )
-    output /= h
-
+    m, n = query.shape[2], key.shape[2]
+    weight = flash_colsum(query, key, is_causal=is_causal, scale=scale)
     if is_causal:
-        c = max(0, n - m)
-        output[:, :c] /= m
-        output[:, c:] /= torch.arange(n - c, 0, -1, device=query.device)
+        c = max(n - m, 0)
+        weight[:, :c] /= m
+        weight[:, c:] /= torch.arange(n - c, 0, -1, device=query.device)
     else:
-        output /= m
-    return output
+        weight /= m
+    return weight / query.shape[1]
