@@ -1,7 +1,5 @@
 # Flash-ColSum
 
-**Fast, memory-efficient attention column sum.**
-
 [![PyPI](https://img.shields.io/pypi/v/flash-colsum)](https://pypi.org/project/flash-colsum/)
 [![License](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
@@ -10,13 +8,11 @@
 
 This primitive is essential for efficient KV-cache pruning, token importance estimation, and attention analysis in Large Language Models (LLMs) and Vision-Language Models (VLMs), such as [SparseVILA](https://arxiv.org/abs/2510.17777).
 
-## Why Flash-ColSum?
+## Highlights
 
-- **🚀 Speed**: Fused Triton kernels minimize HBM reads/writes, significantly outperforming naive PyTorch implementations.
-- **💾 Memory Efficiency**: Computes column statistics in **$O(N)$ memory** instead of $O(N^2)$.
-    - *Example*: Processing a 128k sequence length on a single A6000 GPU (where naive PyTorch OOMs).
-- **🧩 Flexibility**: Supports both **Causal** (autoregressive) and **Non-Causal** (bidirectional) attention patterns, including irregular shapes (e.g., $M \neq N$).
-- **✅ Correctness**: Numerically stable online softmax (FlashAttention style) and correct handling of causal masking normalization.
+- **🚀 Fast & Efficient**: Fused kernels compute column statistics in **$O(N)$ memory**, enabling 128k+ context lengths.
+- **🧩 Flexible**: Supports **causal** and **non-causal** attention with irregular shapes ($M \neq N$).
+- **✅ Exact**: Uses online softmax for numerical precision and correct causal masking.
 
 ## Prerequisites
 
