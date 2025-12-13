@@ -4,31 +4,66 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flash-colsum"
-version = "0.1.0"
-description = "Fast attention column-sum primitives with Triton kernels"
-readme = "README.md"
+version = "0.2.0"
+description = "Fast, memory-efficient attention column sum"
+readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
-license = { text = "Apache License" }
-authors = [
-  { name = "Samir Khaki" }
+license = { text = "MIT License" }
+authors = [{ name = "Z Lab" }]
+keywords = [
+  "triton",
+  "pytorch",
+  "cuda",
+  "attention",
+  "transformers",
+  "gpu",
+  "kernels",
+]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Scientific/Engineering :: Mathematics",
 ]
 dependencies = [
   "torch>=2.1",
   "triton>=3.0.0",
-  "pytest>=7.0",
-  "pytest-cov>=4.0",
-  "matplotlib>=3.7",
-  "rich>=13.7",
 ]
 
 [project.optional-dependencies]
+test = [
+  "pytest>=7",
+  "pytest-cov>=4",
+]
+dev = [
+  "black>=24.0",
+]
+bench = [
+  "matplotlib>=3.7",
+  "rich>=13.7",
+]
+all = [
+  "flash-colsum[test]",
+  "flash-colsum[dev]",
+  "flash-colsum[bench]",
+]
 
 [project.urls]
 Homepage = "https://github.com/z-lab/flash-colsum"
 Issues = "https://github.com/z-lab/flash-colsum/issues"
 
+[tool.black]
+line-length = 120
+target-version = ["py310"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["flash_colsum*"]
-
-

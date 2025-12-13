@@ -1,10 +1,4 @@
-"""
-Flash-ColSum: Efficient attention column-sum operations with Triton kernels.
-"""
+from .flash import *
+from .naive import *
 
-from .ops import flash_colsum
-from .baselines import naive_colsum
-
-__all__ = ["flash_colsum", "naive_colsum"]
-
-__version__ = "1.0.0"
+__version__ = "0.2.0"

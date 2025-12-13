@@ -4,7 +4,7 @@ from typing import Dict, List, Optional
 
 import torch  # noqa: F401
 
-from . import benchmark_colsum as bc
+from benchmarks import benchmark_colsum as bc
 
 
 def _load_csv(path: str) -> List[Dict[str, Optional[float]]]:
@@ -37,20 +37,23 @@ def _load_csv(path: str) -> List[Dict[str, Optional[float]]]:
 
 def plot_unified_from_existing(out_dir: str = "benchmarks/out") -> None:
 	"""
-	Recreate the unified 3x2 benchmark plot from existing CSVs, without re-running sweeps.
+	Recreate the unified benchmark plot from existing CSVs, without re-running sweeps.
 
 	Expected files under out_dir:
 	- noncausal_batched.csv
 	- noncausal.csv
 	- causal.csv
+	- causal_batched.csv (optional)
 	"""
 	noncausal_batched_csv = os.path.join(out_dir, "noncausal_batched.csv")
 	noncausal_csv = os.path.join(out_dir, "noncausal.csv")
 	causal_csv = os.path.join(out_dir, "causal.csv")
+	causal_batched_csv = os.path.join(out_dir, "causal_batched.csv")
 
 	noncausal_batched_results = _load_csv(noncausal_batched_csv)
 	noncausal_results = _load_csv(noncausal_csv)
 	causal_results = _load_csv(causal_csv)
+	causal_batched_results = _load_csv(causal_batched_csv)  # Optional
 
 	if not noncausal_batched_results:
 		print(f"[error] Missing or empty CSV: {noncausal_batched_csv}")
@@ -61,6 +64,10 @@ def plot_unified_from_existing(out_dir: str = "benchmarks/out") -> None:
 	if not causal_results:
 		print(f"[error] Missing or empty CSV: {causal_csv}")
 		return
+	
+	# causal_batched is optional - just warn if missing
+	if not causal_batched_results:
+		print(f"[warn] Missing or empty CSV: {causal_batched_csv} (will generate 3-column plot)")
 
 	bc.create_unified_plot(
 		noncausal_batched_results,
@@ -68,6 +75,7 @@ def plot_unified_from_existing(out_dir: str = "benchmarks/out") -> None:
 		causal_results,
 		out_dir=out_dir,
 		filename="unified_benchmark.png",
+		causal_batched_results=causal_batched_results if causal_batched_results else None,
 	)
 	print(f"[ok] Wrote unified_benchmark.png to {out_dir}")
 
